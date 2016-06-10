@@ -20,6 +20,10 @@ void Main()
 	8. DI: ensure a circular dependency throws an exception (instead of stack overflow)
 	9. DI: make it thread safe
 	10. perf?
+	
+	PART II: Property Injection
+	11. Public property can be set
+	12. Private & base properties can be set, if setter public
 	*/
 }
 
@@ -63,9 +67,21 @@ public class Zoo
 	}
 }
 
-public class FooProp
+public class FooProp : FooPropBase
 {
 	public IBar Bar { get; set; }
+	public IBar BarPrivateSet { get; private set;}
+	private IFoo Foo { get; set;}
+
+	public IFoo GetFoo()
+	{
+		return Foo;
+	}	
+}
+
+public class FooPropBase
+{
+	public Zoo Zoo { get; set;}
 }
 
 public class CircleDepA
@@ -240,31 +256,6 @@ class MyIocTests : UnitTestBase
 
 		Assert.ThrowsException( () => ioc.Resolve<CircleDepA>() );		
 	}
-	
-	//[Test]
-	public void Thread_Safety_3_Threads_of_10k_Resolves()
-	{
-		var ioc = new MyDI();
-
-		ioc.Register<Zoo, Zoo>();
-		ioc.Register<IBar, Bar>();
-		ioc.Register<IFoo, Foo>();
-
-		var mre = new ManualResetEvent(false);
-		var t1 = new Thread(() => RegisterResolve(ioc, mre));
-		var t2 = new Thread(() => RegisterResolve(ioc, mre));
-		var t3 = new Thread(() => RegisterResolve(ioc, mre));
-		
-		t1.Start();
-		t2.Start();
-		t3.Start();
-
-		mre.Set();
-		
-		t1.Join();
-		t2.Join();
-		t3.Join();
-	}
 
 	private void RegisterResolve(MyDI ioc, ManualResetEvent ev)
 	{
@@ -275,11 +266,11 @@ class MyIocTests : UnitTestBase
 		{
 			ioc.Resolve<Bar>();
 			ioc.Resolve<Zoo>();
-			ioc.Resolve<Foo>();
+			ioc.Resolve<FooProp>();
 		}
 	}
 
-	//[Test]
+	[Test]
 	public void Thread_Safety_3_Threads_of_10k_Resolves_CastleWindsor()
 	{
 		var ioc = new Castle.Windsor.WindsorContainer();
@@ -287,6 +278,7 @@ class MyIocTests : UnitTestBase
 		ioc.Register(Component.For<Zoo>().LifestyleTransient());
 		ioc.Register(Component.For<IBar, Bar>().LifestyleTransient());
 		ioc.Register(Component.For<IFoo, Foo>().LifestyleTransient());
+		ioc.Register(Component.For<FooProp, FooProp>().LifestyleTransient());
 
 		var mre = new ManualResetEvent(false);
 		var t1 = new Thread(() => RegisterResolve(ioc, mre));
@@ -316,19 +308,50 @@ class MyIocTests : UnitTestBase
 			ioc.Resolve<Foo>();
 		}
 	}
-	
+
+
 	[Test]
-	public void Test_PropertyInjection()
+	public void Thread_Safety_3_Threads_of_10k_Resolves()
 	{
 		var ioc = new MyDI();
 
 		ioc.Register<Zoo, Zoo>();
 		ioc.Register<IBar, Bar>();
 		ioc.Register<IFoo, Foo>();
+		ioc.Register<FooProp, FooProp>();
+
+		var mre = new ManualResetEvent(false);
+		var t1 = new Thread(() => RegisterResolve(ioc, mre));
+		var t2 = new Thread(() => RegisterResolve(ioc, mre));
+		var t3 = new Thread(() => RegisterResolve(ioc, mre));
+
+		t1.Start();
+		t2.Start();
+		t3.Start();
+
+		mre.Set();
+
+		t1.Join();
+		t2.Join();
+		t3.Join();
+	}
+	
+	[Test]
+	public void Test_PropertyInjection()
+	{
+		var ioc = new MyDI();
+
+		ioc.Register<FooProp, FooProp>();
+		ioc.Register<IBar, Bar>();
+		ioc.Register<IFoo, Foo>();
+		ioc.Register<Zoo, Zoo>();
 		
-		var foo = ioc.Resolve<IFoo>();
-		
-		Assert.IsTrue(foo.Bar != null);
+		var foo = ioc.Resolve<FooProp>();
+
+		Assert.IsTrue(foo.Bar != null); // public prop
+		Assert.IsTrue(foo.BarPrivateSet == null); // public prop, private setter not supported
+		Assert.IsTrue(foo.GetFoo() != null); // private prop's
+		Assert.IsTrue(foo.Zoo != null); // base prop
 	}
 }
 
@@ -377,19 +400,25 @@ public class MyDI
 		if (instances.ContainsKey(type))
 		{
 			var instance = instances[type](circularDependencyTracker);
-			var props = (from p in instance.GetType().GetProperties(BindingFlags.Public | BindingFlags.Instance | BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.FlattenHierarchy)
-						where instances.ContainsKey(p.PropertyType) && p.CanWrite
-						select p);
-			foreach(var prop in props)
+			PropertyInfo[] props;
+			if (!propertyCache.TryGetValue(instance.GetType(), out props) || registrationSinceResolve)
+            {
+				props = (from p in instance.GetType().GetTypeInfo().GetProperties(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
+						 where (p.SetMethod.IsPublic || p.GetMethod.IsPrivate) && instances.ContainsKey(p.PropertyType)
+						 select p).ToArray();
+				propertyCache.AddOrUpdate(instance.GetType(), (_) => props, (_,__) => props);
+			}
+
+			foreach (var prop in props)
 				prop.SetValue(instance, instances[prop.PropertyType](circularDependencyTracker));
-				
 			return instance;
 		}		
 		return null;
 	}
-	
+
 	ConcurrentDictionary<Type, ConstructorInfo> constructorCache = new ConcurrentDictionary<Type, ConstructorInfo>();
-	
+	ConcurrentDictionary<Type, PropertyInfo[]> propertyCache = new ConcurrentDictionary<Type, PropertyInfo[]>();
+
 	Func<HashSet<Type>, object> GreedyConstructor<T>() where T : new()
 	{
 		var type = typeof(T);
