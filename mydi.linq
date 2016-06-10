@@ -1,9 +1,13 @@
-<Query Kind="Program" />
+<Query Kind="Program">
+  <NuGetReference>Castle.Windsor</NuGetReference>
+  <Namespace>System.Collections.Concurrent</Namespace>
+  <Namespace>Castle.MicroKernel.Registration</Namespace>
+</Query>
 
 void Main()
 {
 	var tests = new MyIocTests();
-	tests.RunTests();
+	tests.RunTests(true);
 	
 	/* DI Container kata
 	1. ability to register an instance, and ensure it resolves
@@ -14,6 +18,7 @@ void Main()
 	6. DI: can register types in any order to get valid resolve
 	7. DI: ability to resolve a type using the 'greediest' constructor (one with most registered types)
 	8. DI: ensure a circular dependency throws an exception (instead of stack overflow)
+	9. DI: make it thread safe
 	*/
 }
 
@@ -229,57 +234,133 @@ class MyIocTests : UnitTestBase
 
 		Assert.ThrowsException( () => ioc.Resolve<CircleDepA>() );		
 	}
+	
+	[Test]
+	public void Thread_Safety_3_Threads_of_10k_Resolves()
+	{
+		var ioc = new MyDI();
+
+		ioc.Register<Zoo, Zoo>();
+		ioc.Register<IBar, Bar>();
+		ioc.Register<IFoo, Foo>();
+
+		var mre = new ManualResetEvent(false);
+		var t1 = new Thread(() => RegisterResolve(ioc, mre));
+		var t2 = new Thread(() => RegisterResolve(ioc, mre));
+		var t3 = new Thread(() => RegisterResolve(ioc, mre));
+		
+		t1.Start();
+		t2.Start();
+		t3.Start();
+
+		mre.Set();
+		
+		t1.Join();
+		t2.Join();
+		t3.Join();
+	}
+
+	private void RegisterResolve(MyDI ioc, ManualResetEvent ev)
+	{
+		ev.WaitOne();
+
+		//int count = new Random().Next(500,10000);
+		for (int i = 0; i < 10000; i++)
+		{
+			ioc.Resolve<Bar>();
+			ioc.Resolve<Zoo>();
+			ioc.Resolve<Foo>();
+		}
+	}
+
+	[Test]
+	public void Thread_Safety_3_Threads_of_10k_Resolves_CastleWindsor()
+	{
+		var ioc = new Castle.Windsor.WindsorContainer();
+		
+		ioc.Register(Component.For<Zoo>().LifestyleTransient());
+		ioc.Register(Component.For<IBar, Bar>().LifestyleTransient());
+		ioc.Register(Component.For<IFoo, Foo>().LifestyleTransient());
+
+		var mre = new ManualResetEvent(false);
+		var t1 = new Thread(() => RegisterResolve(ioc, mre));
+		var t2 = new Thread(() => RegisterResolve(ioc, mre));
+		var t3 = new Thread(() => RegisterResolve(ioc, mre));
+
+		t1.Start();
+		t2.Start();
+		t3.Start();
+
+		mre.Set();
+
+		t1.Join();
+		t2.Join();
+		t3.Join();
+	}
+
+	private void RegisterResolve(Castle.Windsor.WindsorContainer ioc, ManualResetEvent ev)
+	{
+		ev.WaitOne();
+
+		//int count = new Random().Next(500,10000);
+		for (int i = 0; i < 10000; i++)
+		{
+			ioc.Resolve<Bar>();
+			ioc.Resolve<Zoo>();
+			ioc.Resolve<Foo>();
+		}
+	}
+
 }
 
 
 // Define other methods and classes here
 public class MyDI
 {
-	Dictionary<Type, Func<object>> instances = new Dictionary<Type, Func<object>>();
+	ConcurrentDictionary<Type, Func<HashSet<Type>, object>> instances = new ConcurrentDictionary<Type, Func<HashSet<Type>, object>>();
 
 	public void Register<TK, T>(T instance) where T : TK
 	{
 		var key = typeof(TK);
-		instances.Add(key, () => instance);
+		instances.AddOrUpdate(key, (_) => instance, (type, func2) => (_) => instance);
 	}
 	
 	public void Register<TK, T>(bool singleton = false) where T : TK, new()
 	{
 		var key = typeof(TK);
 		var instanceConstructor = GreedyConstructor<T>();
+		var func = new Func<HashSet<Type>, object>(instanceConstructor);
 
 		if (singleton)
 		{
-			var lazy = new Lazy<object>(instanceConstructor);
-			instanceConstructor = () => lazy.Value;
-		}
+			var lazy = new Lazy<object>(() => instanceConstructor(new HashSet<Type>()));
+			func = (_) => lazy.Value;
+		}		
 		
-		instances.Add(key, new Func<object>(instanceConstructor));
+		instances.AddOrUpdate(key, func, (type, func2) => func);
 	}
 	
 	public T Resolve<T>()
 	{
-		return (T)Resolve(typeof(T));
+		return (T)Resolve(typeof(T), new HashSet<Type>());
 	}
 	
-	object Resolve(Type type)
+	object Resolve(Type type, HashSet<Type> circularDependencyTracker)
 	{	
 		return instances.ContainsKey(type) 
-				? instances[type]()
+				? instances[type](circularDependencyTracker)
 				: null;
 	}
-
-
-	HashSet<Type> circularDependencyTracker = new HashSet<Type>();
 	
-	Func<object> GreedyConstructor<T>() where T : new()
+	Func<HashSet<Type>, object> GreedyConstructor<T>() where T : new()
 	{
 		var type = typeof(T);
 		
 		var constructors = type.GetConstructors();
 			
-		return () =>
+		return (circularDependencyTracker) =>
 		{
+			// consider caching this, unless registration changes
 			var useThis = (from c in constructors
 						  let p = c.GetParameters().Where(x => instances.ContainsKey(x.ParameterType)).Count()
 						  orderby p descending
@@ -288,11 +369,11 @@ public class MyDI
 			if (!circularDependencyTracker.Add(type))
 				throw new InvalidOperationException(string.Format("Circular dependency detected {0}", type));
 
-			var param = useThis.GetParameters();
+			var parameters = useThis.GetParameters();
 
-			var instance = param.Length == 0
+			var instance = parameters.Length == 0
 				? new T() // shortcut to avoid reflection for simple types
-				: useThis.Invoke(param.Select(p =>  Resolve(p.ParameterType)).ToArray());
+				: useThis.Invoke(parameters.Select(p => Resolve(p.ParameterType, circularDependencyTracker)).ToArray());
 			
 			circularDependencyTracker.Remove(type);
 			return instance;
@@ -383,10 +464,10 @@ class Assert
 		}
 	}
 	
-	public void WriteResults(string methodName)
+	public void WriteResults(string methodName, TimeSpan? duration = null)
 	{
 		if(Passed)
-			Console.WriteLine("Success: {0}", methodName);
+			Console.WriteLine(duration.HasValue ? "Success: {0} | {1}" : "Success: {0}", methodName, duration);
 		else
 			Console.WriteLine("Failed: {0} - {1}", methodName, Message);
 	}
@@ -402,7 +483,7 @@ abstract class UnitTestBase
 		Assert = new Assert();
 	}
 	
-	public void RunTests()
+	public void RunTests(bool reportDuration = false)
 	{
 		// run Setup methods
 		var methods = this.GetType().GetMethods();
@@ -411,6 +492,8 @@ abstract class UnitTestBase
 			this.GetType().InvokeMember(method.Name, BindingFlags.InvokeMethod, null, this, null);
 		}
 		
+		Stopwatch watch = new Stopwatch();
+		
 		// run Test methods
 		foreach (var method in methods.Where(m => m.IsDefined(typeof(TestAttribute), false)))
 		{
@@ -418,10 +501,18 @@ abstract class UnitTestBase
 			Assert.Reset();
 			
 			// run the test
-			this.GetType().InvokeMember(method.Name, BindingFlags.InvokeMethod, null, this, null);
+			Func<object> func = () => this.GetType().InvokeMember(method.Name, BindingFlags.InvokeMethod, null, this, null);
+
+			if (reportDuration)
+			{
+				watch.Restart();
+				func();				
+			}
+			
+			func();
 			
 			// report results
-			Assert.WriteResults(method.Name);
+			Assert.WriteResults(method.Name, reportDuration ? watch.Elapsed : (TimeSpan?)null);
 		}
 		
 		// run Teardown methods
