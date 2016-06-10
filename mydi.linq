@@ -19,6 +19,7 @@ void Main()
 	7. DI: ability to resolve a type using the 'greediest' constructor (one with most registered types)
 	8. DI: ensure a circular dependency throws an exception (instead of stack overflow)
 	9. DI: make it thread safe
+	10. perf?
 	*/
 }
 
@@ -310,7 +311,6 @@ class MyIocTests : UnitTestBase
 			ioc.Resolve<Foo>();
 		}
 	}
-
 }
 
 
@@ -318,11 +318,13 @@ class MyIocTests : UnitTestBase
 public class MyDI
 {
 	ConcurrentDictionary<Type, Func<HashSet<Type>, object>> instances = new ConcurrentDictionary<Type, Func<HashSet<Type>, object>>();
+	bool registrationSinceResolve = false;
+	object lockObj = new object();
 
 	public void Register<TK, T>(T instance) where T : TK
 	{
 		var key = typeof(TK);
-		instances.AddOrUpdate(key, (_) => instance, (type, func2) => (_) => instance);
+		_Register(key, (_) => instance);
 	}
 	
 	public void Register<TK, T>(bool singleton = false) where T : TK, new()
@@ -337,7 +339,13 @@ public class MyDI
 			func = (_) => lazy.Value;
 		}		
 		
+		_Register(key, func);
+	}
+	
+	private void _Register(Type key, Func<HashSet<Type>, object> func)
+	{
 		instances.AddOrUpdate(key, func, (type, func2) => func);
+		lock (lockObj) { registrationSinceResolve = true; }
 	}
 	
 	public T Resolve<T>()
@@ -352,6 +360,8 @@ public class MyDI
 				: null;
 	}
 	
+	ConcurrentDictionary<Type, ConstructorInfo> constructorCache = new ConcurrentDictionary<Type, ConstructorInfo>();
+	
 	Func<HashSet<Type>, object> GreedyConstructor<T>() where T : new()
 	{
 		var type = typeof(T);
@@ -360,20 +370,26 @@ public class MyDI
 			
 		return (circularDependencyTracker) =>
 		{
-			// consider caching this, unless registration changes
-			var useThis = (from c in constructors
-						  let p = c.GetParameters().Where(x => instances.ContainsKey(x.ParameterType)).Count()
-						  orderby p descending
-						  select c).First();
+			ConstructorInfo constructor;
+			if (registrationSinceResolve || !constructorCache.TryGetValue(type, out constructor))
+			{
+				constructor = (from c in constructors
+							   let p = c.GetParameters().Where(x => instances.ContainsKey(x.ParameterType)).Count()
+							   orderby p descending
+							   select c).First();
+				constructorCache.AddOrUpdate(type, (_) => constructor, (_, __) => constructor);
 
+				lock (lockObj) { registrationSinceResolve = false; }
+			}
+			
 			if (!circularDependencyTracker.Add(type))
 				throw new InvalidOperationException(string.Format("Circular dependency detected {0}", type));
 
-			var parameters = useThis.GetParameters();
+			var parameters = constructor.GetParameters();
 
 			var instance = parameters.Length == 0
 				? new T() // shortcut to avoid reflection for simple types
-				: useThis.Invoke(parameters.Select(p => Resolve(p.ParameterType, circularDependencyTracker)).ToArray());
+				: constructor.Invoke(parameters.Select(p => Resolve(p.ParameterType, circularDependencyTracker)).ToArray());
 			
 			circularDependencyTracker.Remove(type);
 			return instance;
