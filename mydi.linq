@@ -6,8 +6,8 @@ void Main()
 	tests.RunTests();
 	
 	/* DI Container kata
-	1. ensure a container only resolves types that were registered
-	2. ability to register an instance, and ensure it resolves
+	1. ability to register an instance, and ensure it resolves
+	2. a container only resolves types that were registered
 	3. ability to register a type. Ensure it resolves
 	4. ability to register a singleton.  Each resolve return same instance	
 	5. DI: ability to resolve a type with a constructor of one parameter of a registered type
@@ -71,11 +71,25 @@ public class CircleDepA
 
 public class CircleDepB
 {
-	public CircleDepA A { get; private set;}
+	public CircleDepC C { get; private set; }
+	public IFoo Foo { get; private set;}
 
 	public CircleDepB() {}
 	
-	public CircleDepB(CircleDepA a)
+	public CircleDepB(IFoo foo, CircleDepC c)
+	{
+		Foo = foo;
+		C = c;
+	}
+}
+
+public class CircleDepC
+{
+	public CircleDepA A { get; private set; }
+
+	public CircleDepC() { }
+
+	public CircleDepC(CircleDepA a)
 	{
 		A = a;
 	}
@@ -210,6 +224,8 @@ class MyIocTests : UnitTestBase
 		
 		ioc.Register<CircleDepA, CircleDepA>();
 		ioc.Register<CircleDepB, CircleDepB>();
+		ioc.Register<CircleDepC, CircleDepC>();
+		ioc.Register<IFoo, Foo>();
 
 		Assert.ThrowsException( () => ioc.Resolve<CircleDepA>() );		
 	}
@@ -247,11 +263,14 @@ public class MyDI
 	}
 	
 	object Resolve(Type type)
-	{		
+	{	
 		return instances.ContainsKey(type) 
 				? instances[type]()
 				: null;
 	}
+
+
+	HashSet<Type> circularDependencyTracker = new HashSet<Type>();
 	
 	Func<object> GreedyConstructor<T>() where T : new()
 	{
@@ -266,12 +285,17 @@ public class MyDI
 						  orderby p descending
 						  select c).First();
 
-			// shortcut to avoid reflection for simple types
-			if (useThis.GetParameters().Length == 0)
-				return new T();
+			if (!circularDependencyTracker.Add(type))
+				throw new InvalidOperationException(string.Format("Circular dependency detected {0}", type));
 
-			var args = useThis.GetParameters().Select(p => Resolve(p.ParameterType)).ToArray();
-			return useThis.Invoke(args);
+			var param = useThis.GetParameters();
+
+			var instance = param.Length == 0
+				? new T() // shortcut to avoid reflection for simple types
+				: useThis.Invoke(param.Select(p =>  Resolve(p.ParameterType)).ToArray());
+			
+			circularDependencyTracker.Remove(type);
+			return instance;
 		};
 	}
 }
@@ -350,13 +374,13 @@ class Assert
 		try 
 		{
 			method();
+			Passed = false;
+			Message = "Expected an exception to be thrown";
 		}
 		catch
 		{
 			Passed = true;
 		}
-		Passed = false;
-		Message = "Expected an exception to be thrown";
 	}
 	
 	public void WriteResults(string methodName)
